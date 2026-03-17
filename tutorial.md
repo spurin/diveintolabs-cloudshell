@@ -27,5 +27,3 @@ Attaching to portal-diveinto-lab, shared-ssh-keys-diveinto-lab
 To access the Portal, click the Web Preview Icon, if you cant find it, click -> <walkthrough-web-preview-icon>here</walkthrough-web-preview-icon> for a walkthrough on where to find it.  
 
 Select 'Preview on Port 8080' and you're good to go!  
-
-When accessing terminals, the default credentials are ansible/password
