@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_NAME="DiveInto Labs"
-COMPOSE_REF="oci://spurin/diveintolabs-cloudshell"
-PORTAL_CONTAINER="portal-diveinto-lab"
-SSH_KEYS_CONTAINER="shared-ssh-keys-diveinto-lab"
-IMAGES=(
+readonly APP_NAME="DiveInto Labs"
+readonly STACK_REF="oci://spurin/diveintolabs-cloudshell"
+readonly PORTAL_NAME="portal-diveinto-lab"
+readonly PORTAL_PORT="8080"
+readonly -a PREPULL_IMAGES=(
   "spurin/ssh-client"
   "spurin/diveinto-lab:portal"
   "spurin/diveinto-lab:node"
   "spurin/diveinto-lab:labapi"
 )
+readonly -a SPINNER=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
-# ---------- styling ----------
 if [[ -t 1 ]]; then
   BOLD="$(tput bold 2>/dev/null || true)"
   DIM="$(tput dim 2>/dev/null || true)"
@@ -20,242 +20,241 @@ if [[ -t 1 ]]; then
   GREEN="$(tput setaf 2 2>/dev/null || true)"
   YELLOW="$(tput setaf 3 2>/dev/null || true)"
   BLUE="$(tput setaf 4 2>/dev/null || true)"
-  MAGENTA="$(tput setaf 5 2>/dev/null || true)"
   CYAN="$(tput setaf 6 2>/dev/null || true)"
+  MAGENTA="$(tput setaf 5 2>/dev/null || true)"
   RESET="$(tput sgr0 2>/dev/null || true)"
   HIDE_CURSOR="$(tput civis 2>/dev/null || true)"
   SHOW_CURSOR="$(tput cnorm 2>/dev/null || true)"
 else
-  BOLD="" DIM="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" RESET=""
-  HIDE_CURSOR="" SHOW_CURSOR=""
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""; RESET=""
+  HIDE_CURSOR=""; SHOW_CURSOR=""
 fi
 
-SPINNER_FRAMES=( "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏" )
+note() { printf "%bℹ%b  %s\n" "$BLUE" "$RESET" "$*"; }
+ok()   { printf "%b✔%b  %s\n" "$GREEN" "$RESET" "$*"; }
+warn() { printf "%b⚠%b  %s\n" "$YELLOW" "$RESET" "$*"; }
+fail() { printf "%b✖%b  %s\n" "$RED" "$RESET" "$*" >&2; }
 
-info()    { printf "%bℹ%b  %s\n" "$BLUE" "$RESET" "$*"; }
-success() { printf "%b✔%b  %s\n" "$GREEN" "$RESET" "$*"; }
-warn()    { printf "%b⚠%b  %s\n" "$YELLOW" "$RESET" "$*"; }
-error()   { printf "%b✖%b  %s\n" "$RED" "$RESET" "$*" >&2; }
-
-cleanup_screen() {
+cleanup_terminal() {
   printf "%b" "$SHOW_CURSOR"
 }
-trap cleanup_screen EXIT
+trap cleanup_terminal EXIT
 
-on_error() {
-  local line="${1:-unknown}"
-  cleanup_screen
-  error "Something went wrong on line ${line}."
-  error "If Docker is still starting, wait a few seconds and run the script again."
-}
-trap 'on_error $LINENO' ERR
+trap 'fail "The script stopped unexpectedly near line ${LINENO}."' ERR
 
-print_banner() {
-  printf "\n%b" "$CYAN"
-  cat <<'BANNER'
-    ____  _            ____      __           __          __        
-   / __ \(_)   _____  /  _/___  / /_____     / /   ____ _/ /_  _____
-  / / / / / | / / _ \ / // __ \/ __/ __ \   / /   / __ `/ __ \/ ___/
- / /_/ / /| |/ /  __// // / / / /_/ /_/ /  / /___/ /_/ / /_/ (__  ) 
-/_____/_/ |___/\___/___/_/ /_/\__/\____/  /_____/\__,_/_.___/____/  
-                                                                     
-BANNER
-  printf "%b" "$RESET"
-  printf "%b%s%b\n\n" "$BOLD" "Browser-based labs, one command away 🚀" "$RESET"
+banner() {
+  printf "\n%b%s%b\n\n" "$BOLD" "${APP_NAME} — Cloud Shell launcher" "$RESET"
 }
 
-require_cmd() {
+need() {
   command -v "$1" >/dev/null 2>&1 || {
-    error "Required command not found: $1"
+    fail "Missing required command: $1"
     exit 1
   }
 }
 
-safe_name() {
-  printf '%s' "$1" | tr '/:' '__'
+check_environment() {
+  note "Checking Docker and Compose"
+  need docker
+  need curl
+
+  docker compose version >/dev/null 2>&1 || {
+    fail "The Docker Compose plugin is required via 'docker compose'."
+    exit 1
+  }
+
+  docker info >/dev/null 2>&1 || {
+    fail "Docker is not ready yet. In Cloud Shell, wait for Docker startup and re-run the script."
+    exit 1
+  }
+
+  ok "Docker is ready"
 }
 
-progress_bar() {
-  local current="$1" total="$2" width="${3:-12}"
-  local filled=0 empty=0
-
-  if (( total > 0 )); then
-    filled=$(( current * width / total ))
-  fi
-  (( filled > width )) && filled="$width"
-  empty=$(( width - filled ))
-
-  printf "["
-  printf "%${filled}s" "" | tr ' ' '='
-  printf "%${empty}s" "" | tr ' ' ' '
-  printf "]"
+sanitize_ref() {
+  printf '%s' "$1" | tr '/:@' '___'
 }
 
-run_with_spinner() {
-  local message="$1"
-  shift
-  local logfile
-  logfile="$(mktemp)"
+split_image_ref() {
+  local ref="$1"
+  local name tail tag
 
-  "$@" >"$logfile" 2>&1 &
-  local pid=$!
-  local i=0
+  name="${ref%%@*}"
+  tail="${name##*/}"
 
-  printf "%b" "$HIDE_CURSOR"
-  while kill -0 "$pid" >/dev/null 2>&1; do
-    printf "\r%b%s%b  %s" "$MAGENTA" "${SPINNER_FRAMES[i]}" "$RESET" "$message"
-    sleep 0.1
-    i=$(( (i + 1) % ${#SPINNER_FRAMES[@]} ))
-  done
-
-  wait "$pid"
-  local rc=$?
-  printf "\r\033[K"
-  printf "%b" "$SHOW_CURSOR"
-
-  if (( rc == 0 )); then
-    success "$message"
+  if [[ "$tail" == *:* ]]; then
+    tag="${tail##*:}"
+    name="${name%:*}"
   else
-    error "$message"
-    [[ -s "$logfile" ]] && sed 's/^/    /' "$logfile" >&2
+    tag="latest"
   fi
 
-  rm -f "$logfile"
-  return "$rc"
+  printf '%s\n%s\n' "$name" "$tag"
 }
 
-preflight_checks() {
-  info "Running preflight checks"
-  require_cmd docker
+get_dockerhub_token() {
+  local repo="$1"
 
-  if ! docker compose version >/dev/null 2>&1; then
-    error "Docker Compose plugin is required but not available via 'docker compose'."
-    exit 1
-  fi
-
-  if ! docker info >/dev/null 2>&1; then
-    error "Docker appears unavailable. In Cloud Shell, wait for Docker to finish starting and retry."
-    exit 1
-  fi
-
-  success "Docker is ready"
+  curl -fsSL \
+    "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
 }
 
-summarise_pull_log() {
+resolve_digest_ref() {
+  local requested_ref="$1"
+  local repo tag api_repo token digest
+  local -a parts
+
+  mapfile -t parts < <(split_image_ref "$requested_ref")
+  repo="${parts[0]}"
+  tag="${parts[1]}"
+
+  api_repo="$repo"
+  [[ "$api_repo" == */* ]] || api_repo="library/${api_repo}"
+
+  token="$(get_dockerhub_token "$api_repo")"
+  [[ -n "$token" ]] || return 1
+
+  digest="$({
+    curl -fsSL \
+      -H "Authorization: Bearer ${token}" \
+      -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+      -D - \
+      -o /dev/null \
+      "https://registry-1.docker.io/v2/${api_repo}/manifests/${tag}"
+  } | awk '
+      BEGIN { IGNORECASE=1 }
+      /^docker-content-digest:/ {
+        sub(/^[^:]+:[[:space:]]*/, "")
+        gsub("\r", "")
+        print
+        exit
+      }')"
+
+  [[ -n "$digest" ]] || return 1
+  printf '%s@%s\n' "$repo" "$digest"
+}
+
+pull_and_pin() {
+  local requested_ref="$1"
+  local digest_ref image_id
+
+  if digest_ref="$(resolve_digest_ref "$requested_ref")"; then
+    printf 'resolved=%s\n' "$digest_ref"
+    docker pull "$digest_ref"
+    image_id="$(docker image inspect --format '{{.Id}}' "$digest_ref")"
+    docker tag "$image_id" "$requested_ref"
+  else
+    printf 'resolved=tag-fallback\n'
+    docker pull "$requested_ref"
+  fi
+}
+
+summarize_pull() {
   local logfile="$1"
 
   awk '
     {
-      line=$0
-      gsub(/\r/, "\n", line)
-      n=split(line, parts, /\n/)
+      raw=$0
+      gsub(/\r/, "\n", raw)
+      n=split(raw, row, /\n/)
       for (i=1; i<=n; i++) {
-        if (parts[i] ~ /^[^:]+: (Pulling fs layer|Waiting|Downloading|Verifying Checksum|Download complete|Extracting|Pull complete|Already exists)$/) {
-          split(parts[i], seg, /: /)
-          state[seg[1]]=seg[2]
-        }
-        if (parts[i] ~ /^Status: /) {
-          status=parts[i]
+        if (row[i] ~ /^[^:]+: (Pulling fs layer|Waiting|Downloading|Verifying Checksum|Download complete|Extracting|Pull complete|Already exists)$/) {
+          split(row[i], a, /: /)
+          layer[a[1]]=a[2]
+        } else if (row[i] ~ /^Status: /) {
+          status=row[i]
           sub(/^Status: /, "", status)
-          last_status=status
+          last=status
+        } else if (row[i] ~ /^resolved=/) {
+          resolved=row[i]
+          sub(/^resolved=/, "", resolved)
         }
       }
     }
     END {
-      total=0; done=0; downloading=0; extracting=0; waiting=0; verifying=0
-      for (layer in state) {
+      total=0; done=0; downloading=0; extracting=0; queued=0
+      for (id in layer) {
         total++
-        s=state[layer]
-        if (s == "Pull complete" || s == "Already exists" || s == "Download complete") done++
-        else if (s == "Downloading") downloading++
-        else if (s == "Extracting") extracting++
-        else if (s == "Waiting" || s == "Pulling fs layer") waiting++
-        else if (s == "Verifying Checksum") verifying++
+        state=layer[id]
+        if (state == "Pull complete" || state == "Already exists" || state == "Download complete") done++
+        else if (state == "Downloading") downloading++
+        else if (state == "Extracting") extracting++
+        else queued++
       }
-      printf "%d|%d|%d|%d|%d|%d|%s\n", total, done, downloading, extracting, waiting, verifying, last_status
+      printf "%d|%d|%d|%d|%d|%s|%s\n", total, done, downloading, extracting, queued, last, resolved
     }
   ' "$logfile"
 }
 
-render_pull_line() {
-  local image="$1"
+draw_progress_line() {
+  local label="$1"
   local logfile="$2"
   local statusfile="$3"
-  local frame_index="$4"
+  local spinner_index="$4"
+  local spin="${SPINNER[spinner_index % ${#SPINNER[@]}]}"
 
   if [[ -f "$statusfile" ]]; then
-    local rc
-    rc="$(cat "$statusfile")"
-    if [[ "$rc" == "0" ]]; then
-      printf "%b✔%b  %-30s ready" "$GREEN" "$RESET" "$image"
+    if [[ "$(<"$statusfile")" == "0" ]]; then
+      printf "%b✔%b  %-30s ready" "$GREEN" "$RESET" "$label"
     else
-      printf "%b✖%b  %-30s failed" "$RED" "$RESET" "$image"
+      printf "%b✖%b  %-30s failed" "$RED" "$RESET" "$label"
     fi
     return
   fi
 
-  local summary total_layers done_layers downloading_layers extracting_layers waiting_layers verifying_layers last_status
-  summary="$(summarise_pull_log "$logfile")"
-  IFS='|' read -r total_layers done_layers downloading_layers extracting_layers waiting_layers verifying_layers last_status <<< "$summary"
+  local total done downloading extracting queued status resolved
+  IFS='|' read -r total done downloading extracting queued status resolved < <(summarize_pull "$logfile")
 
-  local frame="${SPINNER_FRAMES[frame_index % ${#SPINNER_FRAMES[@]}]}"
-
-  if (( total_layers > 0 )); then
-    local bar extra
-    bar="$(progress_bar "$done_layers" "$total_layers" 12)"
-    extra=""
-    (( downloading_layers > 0 )) && extra+=" ↓${downloading_layers}"
-    (( extracting_layers > 0 )) && extra+=" ⇢${extracting_layers}"
-    (( waiting_layers > 0 )) && extra+=" …${waiting_layers}"
-    (( verifying_layers > 0 )) && extra+=" ✓${verifying_layers}"
-    printf "%b%s%b  %-30s %s %2d/%-2d%s" \
-      "$MAGENTA" "$frame" "$RESET" "$image" "$bar" "$done_layers" "$total_layers" "$extra"
-  elif [[ -n "$last_status" ]]; then
-    printf "%b%s%b  %-30s %s" "$MAGENTA" "$frame" "$RESET" "$image" "$last_status"
+  if (( total > 0 )); then
+    printf "%b%s%b  %-30s done %2d/%-2d queued=%d" \
+      "$MAGENTA" "$spin" "$RESET" "$label" "$done" "$total" "$queued"
+  elif [[ -n "$resolved" && "$resolved" != "tag-fallback" ]]; then
+    printf "%b%s%b  %-30s pinned to %s" "$MAGENTA" "$spin" "$RESET" "$label" "$resolved"
+  elif [[ "$resolved" == "tag-fallback" ]]; then
+    printf "%b%s%b  %-30s resolving failed; using tag" "$MAGENTA" "$spin" "$RESET" "$label"
+  elif [[ -n "$status" ]]; then
+    printf "%b%s%b  %-30s %s" "$MAGENTA" "$spin" "$RESET" "$label" "$status"
   else
-    printf "%b%s%b  %-30s contacting registry" "$MAGENTA" "$frame" "$RESET" "$image"
+    printf "%b%s%b  %-30s contacting registry" "$MAGENTA" "$spin" "$RESET" "$label"
   fi
 }
 
-pull_images_parallel() {
-  info "Warming ${#IMAGES[@]} lab images in parallel"
+prepull_images() {
+  note "Pulling lab images"
 
-  local temp_dir count failed tick
-  temp_dir="$(mktemp -d)"
-  count="${#IMAGES[@]}"
-  failed=0
+  local tmpdir count tick failures
+  local -a logs rcfiles pids
+
+  tmpdir="$(mktemp -d)"
+  count="${#PREPULL_IMAGES[@]}"
   tick=0
+  failures=0
 
-  local -a logs statuses pids
-
-  for i in "${!IMAGES[@]}"; do
-    local safe
-    safe="$(safe_name "${IMAGES[i]}")"
-    logs[i]="${temp_dir}/${safe}.log"
-    statuses[i]="${temp_dir}/${safe}.status"
+  for i in "${!PREPULL_IMAGES[@]}"; do
+    logs[i]="${tmpdir}/$(sanitize_ref "${PREPULL_IMAGES[i]}").log"
+    rcfiles[i]="${tmpdir}/$(sanitize_ref "${PREPULL_IMAGES[i]}").rc"
 
     (
-      if docker pull "${IMAGES[i]}" >"${logs[i]}" 2>&1; then
-        printf '0' >"${statuses[i]}"
+      if pull_and_pin "${PREPULL_IMAGES[i]}" >"${logs[i]}" 2>&1; then
+        printf '0' >"${rcfiles[i]}"
       else
-        printf '1' >"${statuses[i]}"
+        printf '1' >"${rcfiles[i]}"
       fi
     ) &
     pids[i]="$!"
   done
 
   printf "%b" "$HIDE_CURSOR"
-  for ((i=0; i<count; i++)); do
-    printf "\n"
-  done
+  for ((i=0; i<count; i++)); do printf "\n"; done
 
   while :; do
     local all_done=1
     printf "\033[%dA" "$count"
 
-    for i in "${!IMAGES[@]}"; do
-      [[ -f "${statuses[i]}" ]] || all_done=0
-      printf "\r\033[K%s\n" "$(render_pull_line "${IMAGES[i]}" "${logs[i]}" "${statuses[i]}" $((tick + i)))"
+    for i in "${!PREPULL_IMAGES[@]}"; do
+      [[ -f "${rcfiles[i]}" ]] || all_done=0
+      printf "\r\033[K%s\n" "$(draw_progress_line "${PREPULL_IMAGES[i]}" "${logs[i]}" "${rcfiles[i]}" $((tick + i)))"
     done
 
     (( all_done == 1 )) && break
@@ -265,85 +264,109 @@ pull_images_parallel() {
 
   printf "%b" "$SHOW_CURSOR"
 
-  for i in "${!IMAGES[@]}"; do
+  for i in "${!PREPULL_IMAGES[@]}"; do
     wait "${pids[i]}" || true
-    if [[ ! -f "${statuses[i]}" ]] || [[ "$(cat "${statuses[i]}")" != "0" ]]; then
-      failed=$((failed + 1))
+    if [[ ! -f "${rcfiles[i]}" || "$(<"${rcfiles[i]}")" != "0" ]]; then
+      failures=$((failures + 1))
       [[ -s "${logs[i]}" ]] && sed 's/^/    /' "${logs[i]}" >&2
     fi
   done
 
-  rm -rf "$temp_dir"
+  rm -rf "$tmpdir"
 
-  if (( failed > 0 )); then
-    error "${failed} image pull(s) failed."
+  if (( failures > 0 )); then
+    fail "${failures} image pull(s) failed."
     exit 1
   fi
 
-  success "All images are ready"
+  ok "All required images are available locally"
 }
 
-cleanup_existing_lab() {
-  info "Cleaning up any previous lab instance"
+run_with_spinner() {
+  local message="$1"
+  shift
 
-  run_with_spinner "Stopping previous containers" \
-    bash -lc 'docker compose -f "$0" down >/dev/null 2>&1 || true' "$COMPOSE_REF"
+  local log_file pid idx rc
+  log_file="$(mktemp)"
 
-  run_with_spinner "Removing previous containers" \
-    bash -lc 'docker compose -f "$0" rm -f >/dev/null 2>&1 || true' "$COMPOSE_REF"
+  "$@" >"$log_file" 2>&1 &
+  pid=$!
+  idx=0
+
+  printf "%b" "$HIDE_CURSOR"
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    printf "\r%b%s%b  %s" "$MAGENTA" "${SPINNER[idx]}" "$RESET" "$message"
+    idx=$(( (idx + 1) % ${#SPINNER[@]} ))
+    sleep 0.1
+  done
+
+  wait "$pid"
+  rc=$?
+  printf "\r\033[K%b" "$SHOW_CURSOR"
+
+  if (( rc == 0 )); then
+    ok "$message"
+  else
+    fail "$message"
+    [[ -s "$log_file" ]] && sed 's/^/    /' "$log_file" >&2
+  fi
+
+  rm -f "$log_file"
+  return "$rc"
+}
+
+teardown_previous_stack() {
+  note "Cleaning up any old lab instance"
+  run_with_spinner "Stopping old containers" bash -lc 'docker compose -f "$0" down >/dev/null 2>&1 || true' "$STACK_REF"
+  run_with_spinner "Removing stopped containers" bash -lc 'docker compose -f "$0" rm -f >/dev/null 2>&1 || true' "$STACK_REF"
 }
 
 wait_for_portal() {
-  local i=0
+  local idx=0
   printf "%b" "$HIDE_CURSOR"
 
   while :; do
-    if docker ps --filter "name=^/${PORTAL_CONTAINER}$" --filter "status=running" --format '{{.Names}}' | grep -qx "$PORTAL_CONTAINER"; then
-      printf "\r\033[K"
-      printf "%b" "$SHOW_CURSOR"
-      success "Portal container is running"
+    if docker ps --filter "name=^/${PORTAL_NAME}$" --filter status=running --format '{{.Names}}' | grep -qx "$PORTAL_NAME"; then
+      printf "\r\033[K%b" "$SHOW_CURSOR"
+      ok "Portal container is running"
       return
     fi
 
-    local status
-    status="$(docker ps -a --filter "name=^/${PORTAL_CONTAINER}$" --format '{{.Status}}' | head -n1 || true)"
-
-    if [[ "$status" == Exited* ]]; then
-      printf "\r\033[K"
-      printf "%b" "$SHOW_CURSOR"
-      error "Portal container exited unexpectedly. Recent logs:"
-      docker compose -f "$COMPOSE_REF" logs --no-color --tail=40 || true
+    local state
+    state="$(docker ps -a --filter "name=^/${PORTAL_NAME}$" --format '{{.Status}}' | head -n1 || true)"
+    if [[ "$state" == Exited* ]]; then
+      printf "\r\033[K%b" "$SHOW_CURSOR"
+      fail "Portal container exited unexpectedly. Recent logs:"
+      docker compose -f "$STACK_REF" logs --no-color --tail=40 || true
       exit 1
     fi
 
-    printf "\r%b%s%b  Waiting for portal to be ready" "$MAGENTA" "${SPINNER_FRAMES[i]}" "$RESET"
+    printf "\r%b%s%b  Waiting for portal" "$MAGENTA" "${SPINNER[idx]}" "$RESET"
+    idx=$(( (idx + 1) % ${#SPINNER[@]} ))
     sleep 0.15
-    i=$(( (i + 1) % ${#SPINNER_FRAMES[@]} ))
   done
 }
 
-show_access_details() {
-  printf "\n%b%s%b\n" "$BOLD" "Portal access" "$RESET"
-  printf "  • On the Cloud Shell toolbar, click the %bWeb Preview%b icon %b[<>]%b\n" "$CYAN" "$RESET" "$DIM" "$RESET"
-  printf "  • Then choose %bPreview on Port 8080%b\n" "$CYAN" "$RESET"
-
-  printf "\n%b%s%b\n" "$BOLD" "Stopping the lab" "$RESET"
-  printf "  • Run %bdocker compose -f %s down%b when you are done\n\n" "$DIM" "$COMPOSE_REF" "$RESET"
+show_next_steps() {
+  printf "\n%bPortal access%b\n" "$BOLD" "$RESET"
+  printf "  • In Cloud Shell, click %bWeb Preview%b and choose %bPreview on Port %s%b\n" "$CYAN" "$RESET" "$CYAN" "$PORTAL_PORT" "$RESET"
+  printf "\n%bStopping the lab%b\n" "$BOLD" "$RESET"
+  printf "  • %bdocker compose -f %s down%b\n\n" "$DIM" "$STACK_REF" "$RESET"
 }
 
-launch_lab() {
-  info "Starting ${APP_NAME} in the background"
-  docker compose -f "$COMPOSE_REF" up -d --no-build
+launch_stack() {
+  note "Starting ${APP_NAME}"
+  docker compose -f "$STACK_REF" up -d --pull never --no-build
   wait_for_portal
-  show_access_details
+  show_next_steps
 }
 
 main() {
-  print_banner
-  preflight_checks
-  pull_images_parallel
-  cleanup_existing_lab
-  launch_lab
+  banner
+  check_environment
+  prepull_images
+  teardown_previous_stack
+  launch_stack
 }
 
 main "$@"
