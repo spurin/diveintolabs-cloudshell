@@ -7,9 +7,10 @@ readonly PORTAL_NAME="portal-diveinto-lab"
 readonly PORTAL_PORT="8080"
 readonly -a PREPULL_IMAGES=(
   "spurin/ssh-client"
-  "spurin/diveinto-lab:portal"
-  "spurin/diveinto-lab:node"
-  "spurin/diveinto-lab:labapi"
+  "spurin/diveintolabs:portal"
+  "spurin/diveintolabs:node"
+  "spurin/diveintolabs:bootstrap"
+  "spurin/diveintolabs:labapi"
 )
 readonly -a SPINNER=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
@@ -359,6 +360,9 @@ launch_stack() {
   docker compose -f "$STACK_REF" up -d --pull never --no-build
   wait_for_portal
   show_next_steps
+  # Temporary
+  docker tag spurin/diveintolabs:node spurin/diveinto-lab:node 2>&1
+  docker tag spurin/diveintolabs:labapi spurin/diveinto-lab:labapi 2>&1
 }
 
 main() {
