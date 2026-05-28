@@ -360,14 +360,32 @@ launch_stack() {
   docker compose -f "$STACK_REF" up -d --pull never --no-build
   wait_for_portal
   show_next_steps
-  # Temporary
-  docker tag spurin/diveintolabs:node spurin/diveinto-lab:node 2>&1
-  docker tag spurin/diveintolabs:labapi spurin/diveinto-lab:labapi 2>&1
 }
+
+ensure_host_mount_targets() {
+  note "Ensuring host-mount targets for lab containers"
+
+  local -a stubs=(/lib/modules /usr/src)
+  local -a missing=()
+  local d
+
+  for d in "${stubs[@]}"; do
+    [[ -d "$d" ]] || missing+=("$d")
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    ok "Host-mount targets already present (${stubs[*]})"
+  else
+    sudo mkdir -p "${missing[@]}"
+    ok "Created host-mount targets: ${missing[*]}"
+  fi
+}
+
 
 main() {
   banner
   check_environment
+  ensure_host_mount_targets
   prepull_images
   teardown_previous_stack
   launch_stack
